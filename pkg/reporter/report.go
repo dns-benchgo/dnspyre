@@ -27,6 +27,7 @@ type reportParameters struct {
 	authenticatedDomains      map[string]struct{}
 	benchmarkDuration         time.Duration
 	dohResponseStatusesTotals map[int]int64
+	geocode                   string // 添加地区信息字段
 }
 
 type reportPrinter interface {
@@ -35,7 +36,7 @@ type reportPrinter interface {
 
 // PrintReport prints formatted benchmark result to stdout, exports graphs and generates CSV output if configured.
 // If there is a fatal error while printing report, an error is returned.
-func PrintReport(b *dnsbench.Benchmark, stats []*dnsbench.ResultStats, benchStart time.Time, benchDuration time.Duration) error {
+func PrintReport(b *dnsbench.Benchmark, stats []*dnsbench.ResultStats, benchStart time.Time, benchDuration time.Duration, geocode string) error {
 	totals := Merge(b, stats)
 
 	top3errs := make(map[string]int)
@@ -109,6 +110,7 @@ func PrintReport(b *dnsbench.Benchmark, stats []*dnsbench.ResultStats, benchStar
 		authenticatedDomains:      totals.AuthenticatedDomains,
 		benchmarkDuration:         benchDuration,
 		dohResponseStatusesTotals: totals.DoHStatusCodes,
+		geocode:                   geocode, // 添加地区信息
 	}
 	return printer(b).print(params)
 }

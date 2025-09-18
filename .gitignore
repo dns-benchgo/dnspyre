@@ -44,3 +44,6 @@ _site
 .jekyll-cache
 completions
 manpages/
+
+# macOS
+.DS_Store

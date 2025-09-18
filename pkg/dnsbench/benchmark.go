@@ -168,6 +168,10 @@ type Benchmark struct {
 	Csv string
 	// JSON controls whether the Benchmark.PrintReport prints the Benchmark results in JSON format (option is true).
 	JSON bool
+	// BatchJSON specifies comma-separated list of DNS servers for batch testing and JSON generation.
+	BatchJSON string
+	// HTML path to file, where the benchmark results are written as HTML report with embedded visualization.
+	HTML string
 
 	// Silent controls whether the Benchmark.Run and Benchmark.PrintReport writes anything to stdout.
 	Silent bool

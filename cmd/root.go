@@ -1,19 +1,26 @@
-// Package cmd provides the main CLI interface for dnspyre.
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/miekg/dns"
 	"github.com/tantalor93/dnspyre/v3/pkg/dnsbench"
+	"github.com/tantalor93/dnspyre/v3/pkg/geo"
 	"github.com/tantalor93/dnspyre/v3/pkg/printutils"
 	"github.com/tantalor93/dnspyre/v3/pkg/reporter"
+	"github.com/tantalor93/dnspyre/v3/pkg/scoring"
 )
 
 var (
@@ -25,6 +32,20 @@ var (
 
 var (
 	pApp = kingpin.New("dnspyre", "A high QPS DNS benchmark.").Author(author)
+
+	// Main benchmark command (default)
+	benchmarkCmd = pApp.Command("benchmark", "Run DNS benchmark").Default()
+
+	// Frontend command
+	frontendCmd  = pApp.Command("frontend", "Start web frontend for DNS benchmark result analysis")
+	frontendPort = frontendCmd.Flag("port", "Port to run the frontend server on").
+			Short('p').Default("8080").String()
+	frontendHost = frontendCmd.Flag("host", "Host to bind the frontend server to").
+			Default("localhost").String()
+	frontendOpen = frontendCmd.Flag("open", "Automatically open browser").
+			Default("true").Bool()
+	frontendFile = frontendCmd.Flag("file", "Preload JSON data file").
+			Short('f').String()
 
 	benchmark = dnsbench.Benchmark{
 		Writer: os.Stdout,
@@ -41,26 +62,26 @@ const (
 )
 
 func init() {
-	pApp.Flag("server", "Server represents (plain DNS, DoT, DoH or DoQ) server, which will be benchmarked. "+
+	benchmarkCmd.Flag("server", "Server represents (plain DNS, DoT, DoH or DoQ) server, which will be benchmarked. "+
 		"Format depends on the DNS protocol, that should be used for DNS benchmark. "+
 		"For plain DNS (either over UDP or TCP) the format is <IP/host>[:port], if port is not provided then port 53 is used. "+
 		"For DoT the format is <IP/host>[:port], if port is not provided then port 853 is used. "+
 		"For DoH the format is https://<IP/host>[:port][/path] or http://<IP/host>[:port][/path], if port is not provided then either 443 or 80 port is used. If no path is provided, then /dns-query is used. "+
 		"For DoQ the format is quic://<IP/host>[:port], if port is not provided then port 853 is used.").Short('s').Default("127.0.0.1").StringVar(&benchmark.Server)
 
-	pApp.Flag("type", "Query type. Repeatable flag. If multiple query types are specified then each query will be duplicated for each type.").
+	benchmarkCmd.Flag("type", "Query type. Repeatable flag. If multiple query types are specified then each query will be duplicated for each type.").
 		Short('t').Default("A").EnumsVar(&benchmark.Types, getSupportedDNSTypes()...)
 
-	pApp.Flag("number", "How many times the provided queries are repeated. Note that the total number of queries issued = types*number*concurrency*len(queries).").
+	benchmarkCmd.Flag("number", "How many times the provided queries are repeated. Note that the total number of queries issued = types*number*concurrency*len(queries).").
 		Short('n').PlaceHolder("1").Int64Var(&benchmark.Count)
 
-	pApp.Flag("concurrency", "Number of concurrent queries to issue.").
+	benchmarkCmd.Flag("concurrency", "Number of concurrent queries to issue.").
 		Short('c').Default("1").Uint32Var(&benchmark.Concurrency)
 
-	pApp.Flag("rate-limit", "Apply a global questions / second rate limit.").
+	benchmarkCmd.Flag("rate-limit", "Apply a global questions / second rate limit.").
 		Short('l').Default("0").IntVar(&benchmark.Rate)
 
-	pApp.Flag("rate-limit-worker", "Apply a questions / second rate limit for each concurrent worker specified by --concurrency option.").
+	benchmarkCmd.Flag("rate-limit-worker", "Apply a questions / second rate limit for each concurrent worker specified by --concurrency option.").
 		Default("0").IntVar(&benchmark.RateLimitWorker)
 
 	pApp.Flag("query-per-conn", "Queries on a connection before creating a new one. 0: unlimited. Applicable for plain DNS and DoT, this option is not considered for DoH or DoQ.").
@@ -115,6 +136,12 @@ func init() {
 
 	pApp.Flag("json", "Report benchmark results as JSON.").BoolVar(&benchmark.JSON)
 
+	pApp.Flag("batch-json", "Generate batch JSON output for multiple servers. Format: server1,server2,server3").
+		PlaceHolder("8.8.8.8,1.1.1.1,114.114.114.114").StringVar(&benchmark.BatchJSON)
+
+	pApp.Flag("html", "Path to create HTML report file with embedded benchmark results.").
+		PlaceHolder("/path/to/report.html").StringVar(&benchmark.HTML)
+
 	pApp.Flag("silent", "Disable stdout.").BoolVar(&benchmark.Silent)
 
 	pApp.Flag("color", "ANSI Color output. Enabled by default.").
@@ -168,7 +195,7 @@ func init() {
 	pApp.Flag("prometheus", "Enables Prometheus metrics endpoint on the specified address. For example :8080 or localhost:8080. The endpoint is available at /metrics path.").
 		PlaceHolder(":8080").StringVar(&benchmark.PrometheusMetricsAddr)
 
-	pApp.Arg("queries", "Queries to issue. It can be a local file referenced using @<file-path>, for example @data/2-domains. "+
+	benchmarkCmd.Arg("queries", "Queries to issue. It can be a local file referenced using @<file-path>, for example @data/2-domains. "+
 		"It can also be resource accessible using HTTP, like https://raw.githubusercontent.com/Tantalor93/dnspyre/master/data/1000-domains, in that "+
 		"case, the file will be downloaded and saved in-memory. "+
 		"These data sources can be combined, for example \"google.com @data/2-domains https://raw.githubusercontent.com/Tantalor93/dnspyre/master/data/2-domains\"").
@@ -183,7 +210,34 @@ func init() {
 // Execute starts main logic of command.
 func Execute() {
 	pApp.Version(Version)
-	kingpin.MustParse(pApp.Parse(os.Args[1:]))
+	parsed := kingpin.MustParse(pApp.Parse(os.Args[1:]))
+
+	// Handle frontend command
+	if parsed == frontendCmd.FullCommand() {
+		config := FrontendConfig{
+			Port:        *frontendPort,
+			Host:        *frontendHost,
+			OpenBrowser: *frontendOpen,
+			PreloadFile: *frontendFile,
+		}
+
+		if err := StartFrontendServer(config); err != nil {
+			printutils.ErrFprintf(os.Stderr, "Frontend server error: %s\n", err.Error())
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Handle benchmark command (default behavior)
+
+	// Check if batch JSON is requested
+	if len(benchmark.BatchJSON) > 0 {
+		if err := runBatchBenchmark(benchmark.BatchJSON); err != nil {
+			printutils.ErrFprintf(os.Stderr, "Batch benchmark error: %s\n", err.Error())
+			os.Exit(1)
+		}
+		return
+	}
 
 	sigsInt := make(chan os.Signal, 8)
 	signal.Notify(sigsInt, syscall.SIGINT)
@@ -214,10 +268,21 @@ func Execute() {
 		os.Exit(1)
 	}
 
-	if err := reporter.PrintReport(&benchmark, res, start, end.Sub(start)); err != nil {
+	if err := reporter.PrintReport(&benchmark, res, start, end.Sub(start), getServerGeocode(benchmark.Server)); err != nil {
 		printutils.ErrFprintf(os.Stderr, "There was an error while printing report: %s\n", err.Error())
 		close(sigsInt)
 		os.Exit(1)
+	}
+
+	// Handle HTML output if specified
+	if benchmark.HTML != "" {
+		stats := reporter.Merge(&benchmark, res)
+		jsonData, err := generateJSONForHTML(&stats, &benchmark, end.Sub(start))
+		if err != nil {
+			printutils.ErrFprintf(os.Stderr, "Failed to generate JSON for HTML output: %s\n", err.Error())
+		} else if err := OutputHTML(benchmark.HTML, jsonData); err != nil {
+			printutils.ErrFprintf(os.Stderr, "Failed to generate HTML output: %s\n", err.Error())
+		}
 	}
 
 	close(sigsInt)
@@ -253,4 +318,505 @@ func getSupportedDNSTypes() []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// generateJSONForHTML creates JSON data suitable for HTML visualization
+func generateJSONForHTML(stats *reporter.BenchmarkResultStats, b *dnsbench.Benchmark, benchDuration time.Duration) (string, error) {
+	// Create a structure similar to jsonResult but with access to internal data
+	codeTotalsMapped := make(map[string]int64)
+	if b.Rcodes {
+		for rcode, total := range stats.Codes {
+			codeTotalsMapped[dns.RcodeToString[rcode]] = total
+		}
+	}
+
+	// Create histogram points
+	var histogramPoints []map[string]interface{}
+	if b.HistDisplay {
+		res := make([]map[string]interface{}, 0)
+		for _, bar := range stats.Hist.Distribution() {
+			if bar.Count > 0 {
+				res = append(res, map[string]interface{}{
+					"latencyMs": time.Duration(bar.To).Milliseconds(),
+					"count":     bar.Count,
+				})
+			}
+		}
+		histogramPoints = res
+	}
+
+	// Calculate performance score
+	metrics := scoring.BenchmarkMetrics{
+		TotalRequests:         stats.Counters.Total,
+		TotalSuccessResponses: stats.Counters.Success,
+		TotalErrorResponses:   stats.Counters.Error,
+		TotalIOErrors:         stats.Counters.IOError,
+		QueriesPerSecond:      math.Round(float64(stats.Counters.Total)/benchDuration.Seconds()*100) / 100,
+		LatencyStats: scoring.LatencyMetrics{
+			MeanMs: time.Duration(stats.Hist.Mean()).Milliseconds(),
+			StdMs:  time.Duration(stats.Hist.StdDev()).Milliseconds(),
+			P50Ms:  time.Duration(stats.Hist.ValueAtQuantile(50)).Milliseconds(),
+			P95Ms:  time.Duration(stats.Hist.ValueAtQuantile(95)).Milliseconds(),
+		},
+	}
+	scoreResult := scoring.CalculateScore(metrics)
+
+	serverResult := map[string]interface{}{
+		"totalRequests":            stats.Counters.Total,
+		"totalSuccessResponses":    stats.Counters.Success,
+		"totalNegativeResponses":   stats.Counters.Negative,
+		"totalErrorResponses":      stats.Counters.Error,
+		"totalIOErrors":            stats.Counters.IOError,
+		"totalIDmismatch":          stats.Counters.IDmismatch,
+		"totalTruncatedResponses":  stats.Counters.Truncated,
+		"queriesPerSecond":         math.Round(float64(stats.Counters.Total)/benchDuration.Seconds()*100) / 100,
+		"benchmarkDurationSeconds": benchDuration.Seconds(),
+		"responseRcodes":           codeTotalsMapped,
+		"questionTypes":            stats.Qtypes,
+		"score":                    scoreResult,
+		"geocode":                  getServerGeocode(benchmark.Server),
+		"ip":                       extractIPFromServer(benchmark.Server),
+		"latencyStats": map[string]interface{}{
+			"minMs":  time.Duration(stats.Hist.Min()).Milliseconds(),
+			"meanMs": time.Duration(stats.Hist.Mean()).Milliseconds(),
+			"stdMs":  time.Duration(stats.Hist.StdDev()).Milliseconds(),
+			"maxMs":  time.Duration(stats.Hist.Max()).Milliseconds(),
+			"p99Ms":  time.Duration(stats.Hist.ValueAtQuantile(99)).Milliseconds(),
+			"p95Ms":  time.Duration(stats.Hist.ValueAtQuantile(95)).Milliseconds(),
+			"p90Ms":  time.Duration(stats.Hist.ValueAtQuantile(90)).Milliseconds(),
+			"p75Ms":  time.Duration(stats.Hist.ValueAtQuantile(75)).Milliseconds(),
+			"p50Ms":  time.Duration(stats.Hist.ValueAtQuantile(50)).Milliseconds(),
+		},
+		"latencyDistribution":        histogramPoints,
+		"dohHTTPResponseStatusCodes": stats.DoHStatusCodes,
+	}
+
+	if b.DNSSEC {
+		totalDNSSECSecuredDomains := len(stats.AuthenticatedDomains)
+		serverResult["totalDNSSECSecuredDomains"] = &totalDNSSECSecuredDomains
+	}
+
+	// Wrap in multi-server format
+	result := map[string]interface{}{
+		benchmark.Server: serverResult,
+	}
+
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(result); err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
+}
+
+// extractIPFromServer extracts IP address from server string
+func extractIPFromServer(server string) string {
+	// Simple extraction - if it's an IP address, return it
+	// If it's a hostname with protocol, try to extract the hostname part
+	// This is a basic implementation that could be enhanced
+	if server == "" {
+		return ""
+	}
+
+	// Handle DoH URLs
+	if len(server) > 8 && server[:8] == "https://" {
+		return server[8:] // Return everything after https://
+	}
+	// Handle DoT URLs
+	if len(server) > 6 && server[:6] == "tls://" {
+		return server[6:] // Return everything after tls://
+	}
+	// Handle DoQ URLs
+	if len(server) > 7 && server[:7] == "quic://" {
+		return server[7:] // Return everything after quic://
+	}
+
+	// For plain DNS (IP:port or just IP), return as is
+	return server
+}
+
+// OutputHTML creates a standalone HTML file with benchmark results
+func OutputHTML(outputPath string, resultString string) error {
+	htmlFilePath := outputPath
+	if !strings.HasSuffix(htmlFilePath, ".html") {
+		htmlFilePath = strings.TrimSuffix(htmlFilePath, ".json") + ".html"
+	}
+
+	htmlFile, err := os.Create(htmlFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create HTML file: %v", err)
+	}
+	defer htmlFile.Close()
+
+	// Create a single server report HTML template
+	singleServerTemplate := `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DNS 服务器性能报告</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f7;
+            color: #1d1d1f;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+        h1 {
+            text-align: center;
+            color: #1d1d1f;
+            margin-bottom: 30px;
+            font-weight: 600;
+        }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .metric-card {
+            padding: 20px;
+            border-radius: 10px;
+            color: white;
+            text-align: center;
+        }
+        .metric-title {
+            font-size: 14px;
+            opacity: 0.9;
+            margin-bottom: 8px;
+        }
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .metric-subtitle {
+            font-size: 12px;
+            opacity: 0.8;
+        }
+        .score-section {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }
+        .latency-section {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .success-section {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+        .qps-section {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+        .chart-container {
+            margin: 30px 0;
+            height: 400px;
+        }
+        .details-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        .details-table th,
+        .details-table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        .details-table th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>DNS 服务器性能报告</h1>
+        
+        <div class="metrics-grid">
+            <div class="metric-card score-section">
+                <div class="metric-title">综合评分</div>
+                <div class="metric-value" id="totalScore">-</div>
+                <div class="metric-subtitle">总分 (满分100)</div>
+            </div>
+            <div class="metric-card latency-section">
+                <div class="metric-title">平均延迟</div>
+                <div class="metric-value" id="avgLatency">-</div>
+                <div class="metric-subtitle">毫秒 (ms)</div>
+            </div>
+            <div class="metric-card success-section">
+                <div class="metric-title">成功率</div>
+                <div class="metric-value" id="successRate">-</div>
+                <div class="metric-subtitle">百分比 (%)</div>
+            </div>
+            <div class="metric-card qps-section">
+                <div class="metric-title">查询速率</div>
+                <div class="metric-value" id="qpsValue">-</div>
+                <div class="metric-subtitle">查询/秒 (QPS)</div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="scoreChart"></canvas>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="latencyChart"></canvas>
+        </div>
+
+        <table class="details-table">
+            <thead>
+                <tr>
+                    <th>指标</th>
+                    <th>数值</th>
+                    <th>说明</th>
+                </tr>
+            </thead>
+            <tbody id="detailsTableBody">
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        const data = __JSON_DATA_PLACEHOLDER__;
+        
+        // Update metric cards
+        document.getElementById('totalScore').textContent = data.score.total.toFixed(1);
+        document.getElementById('avgLatency').textContent = data.latencyStats.meanMs;
+        document.getElementById('successRate').textContent = ((data.totalSuccessResponses / data.totalRequests) * 100).toFixed(2);
+        document.getElementById('qpsValue').textContent = data.queriesPerSecond.toFixed(1);
+
+        // Create score breakdown chart
+        const scoreCtx = document.getElementById('scoreChart').getContext('2d');
+        new Chart(scoreCtx, {
+            type: 'radar',
+            data: {
+                labels: ['成功率', '延迟', '错误率', 'QPS'],
+                datasets: [{
+                    label: '性能评分',
+                    data: [data.score.successRate, data.score.latency, data.score.errorRate, data.score.qps],
+                    fill: true,
+                    backgroundColor: 'rgba(54, 162, 235, 0.2)',
+                    borderColor: 'rgba(54, 162, 235, 1)',
+                    pointBackgroundColor: 'rgba(54, 162, 235, 1)',
+                    pointBorderColor: '#fff',
+                    pointHoverBackgroundColor: '#fff',
+                    pointHoverBorderColor: 'rgba(54, 162, 235, 1)'
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    r: {
+                        beginAtZero: true,
+                        max: 100,
+                        ticks: {
+                            stepSize: 20
+                        }
+                    }
+                }
+            }
+        });
+
+        // Create latency distribution chart if data is available
+        if (data.latencyDistribution && data.latencyDistribution.length > 0) {
+            const latencyCtx = document.getElementById('latencyChart').getContext('2d');
+            const latencyLabels = data.latencyDistribution.map(item => item.latencyMs + 'ms');
+            const latencyCounts = data.latencyDistribution.map(item => item.count);
+            
+            new Chart(latencyCtx, {
+                type: 'bar',
+                data: {
+                    labels: latencyLabels,
+                    datasets: [{
+                        label: '请求数量',
+                        data: latencyCounts,
+                        backgroundColor: 'rgba(75, 192, 192, 0.6)',
+                        borderColor: 'rgba(75, 192, 192, 1)',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: '延迟分布图'
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: '请求数量'
+                            }
+                        },
+                        x: {
+                            title: {
+                                display: true,
+                                text: '延迟 (ms)'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Populate details table
+        const detailsTableBody = document.getElementById('detailsTableBody');
+        const details = [
+            ['总请求数', data.totalRequests, '测试期间发送的总DNS查询数'],
+            ['成功响应', data.totalSuccessResponses, '成功解析的DNS查询数'],
+            ['错误响应', data.totalErrorResponses, 'DNS服务器返回错误的查询数'],
+            ['IO错误', data.totalIOErrors, '网络IO错误的查询数'],
+            ['测试时长', data.benchmarkDurationSeconds.toFixed(2) + '秒', '基准测试持续时间'],
+            ['平均延迟', data.latencyStats.meanMs + 'ms', '所有查询的平均响应时间'],
+            ['P50延迟', data.latencyStats.p50Ms + 'ms', '50%查询的响应时间在此值以下'],
+            ['P95延迟', data.latencyStats.p95Ms + 'ms', '95%查询的响应时间在此值以下'],
+            ['P99延迟', data.latencyStats.p99Ms + 'ms', '99%查询的响应时间在此值以下']
+        ];
+
+        details.forEach(([metric, value, description]) => {
+            const row = detailsTableBody.insertRow();
+            row.insertCell(0).textContent = metric;
+            row.insertCell(1).textContent = value;
+            row.insertCell(2).textContent = description;
+        });
+    </script>
+</body>
+</html>`
+
+	htmlTemplate := strings.Replace(singleServerTemplate, "__JSON_DATA_PLACEHOLDER__", resultString, 1)
+
+	_, err = htmlFile.WriteString(htmlTemplate)
+	if err != nil {
+		return fmt.Errorf("failed to write HTML file: %v", err)
+	}
+
+	log.Printf("HTML output written to: %s", htmlFilePath)
+	return nil
+}
+
+// getServerGeocode returns the geocode for a DNS server based on IP address
+func getServerGeocode(server string) string {
+	// Try to use geo service first
+	geoService, err := geo.NewGeoService()
+	if err == nil && geoService != nil {
+		defer geoService.Close()
+		_, geoCode, err := geoService.CheckGeo(server, true)
+		if err == nil {
+			return geoCode
+		}
+	}
+
+	// Fallback for unknown locations
+	return "XX"
+}
+
+// runBatchBenchmark runs benchmark on multiple servers and generates batch JSON output
+func runBatchBenchmark(serverList string) error {
+	servers := strings.Split(serverList, ",")
+	if len(servers) == 0 {
+		return fmt.Errorf("no servers provided for batch benchmark")
+	}
+
+	// Output progress to stderr instead of stdout to avoid polluting JSON
+	fmt.Fprintf(os.Stderr, "Starting batch benchmark for %d servers...\n", len(servers))
+
+	batchResults := make(map[string]interface{})
+
+	for _, server := range servers {
+		server = strings.TrimSpace(server)
+		if server == "" {
+			continue
+		}
+
+		fmt.Fprintf(os.Stderr, "Testing server: %s\n", server)
+
+		// Create a copy of the global benchmark config for this server
+		serverBenchmark := benchmark
+		serverBenchmark.Server = server
+		serverBenchmark.JSON = true   // Force JSON output
+		serverBenchmark.Silent = true // Suppress normal output
+
+		// Run benchmark for this server
+		ctx := context.Background()
+		start := time.Now()
+		res, err := serverBenchmark.Run(ctx)
+		end := time.Now()
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error testing server %s: %v\n", server, err)
+			continue
+		}
+
+		// Generate JSON result for this server
+		jsonData, err := generateJSONForServer(&serverBenchmark, res, start, end.Sub(start), server)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating JSON for server %s: %v\n", server, err)
+			continue
+		}
+
+		// Parse the JSON - now it's already in multi-server format
+		var multiServerResult map[string]interface{}
+		if err := json.Unmarshal(jsonData, &multiServerResult); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing JSON for server %s: %v\n", server, err)
+			continue
+		}
+
+		// Extract the server result from the multi-server format
+		if serverResult, exists := multiServerResult[server]; exists {
+			batchResults[server] = serverResult
+		} else {
+			// Fallback: take the first (and should be only) result
+			for _, result := range multiServerResult {
+				batchResults[server] = result
+				break
+			}
+		}
+		fmt.Fprintf(os.Stderr, "Completed testing server: %s\n", server)
+	}
+
+	// Output batch results as JSON to stdout
+	batchJSON, err := json.MarshalIndent(batchResults, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch results: %v", err)
+	}
+
+	fmt.Println(string(batchJSON))
+	return nil
+}
+
+// generateJSONForServer generates JSON output for a single server benchmark result
+func generateJSONForServer(bench *dnsbench.Benchmark, res []*dnsbench.ResultStats, start time.Time, duration time.Duration, server string) ([]byte, error) {
+	// Use a buffer to capture the JSON output
+	var buf bytes.Buffer
+	originalWriter := bench.Writer
+	originalSilent := bench.Silent
+
+	bench.Writer = &buf
+	bench.Silent = false // Ensure output is generated even in batch mode
+
+	// Generate the report which will write JSON to our buffer
+	geocode := getServerGeocode(server)
+	if err := reporter.PrintReport(bench, res, start, duration, geocode); err != nil {
+		bench.Writer = originalWriter // Restore original writer
+		bench.Silent = originalSilent // Restore original silent flag
+		return nil, err
+	}
+
+	bench.Writer = originalWriter // Restore original writer
+	bench.Silent = originalSilent // Restore original silent flag
+	return buf.Bytes(), nil
 }
